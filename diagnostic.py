@@ -1,50 +1,21 @@
-import re
 import cv2
 import pytesseract
 import numpy as np
-
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
-from typing import List
-
-app = FastAPI(title="PUBGM OCR Diagnostic")
-
-# ============================================================
-# CURRENT TABLE COORDINATES
-# ============================================================
-
+app = FastAPI(title="PUBGM OCR Diagnostic 2")
 TABLE = (0.21, 0.47, 0.80, 0.695)
-
 ROW_Y = [
     0.26,
     0.445,
     0.625,
     0.81,
 ]
-
-COLS = {
-    "player": (0.015, 0.30),
-    "kills": (0.355, 0.45),
-    "assists": (0.445, 0.52),
-    "damage": (0.515, 0.60),
-    "survival": (0.595, 0.685),
-    "hp_recovered": (0.685, 0.775),
-    "rescues": (0.775, 0.845),
-    "return": (0.845, 0.91),
-    "score": (0.905, 0.995),
-}
-
-
-def ocr(cell, psm=7, whitelist=None):
-
-    if cell is None or cell.size == 0:
-        return ""
-
+def prepare(image):
     gray = cv2.cvtColor(
-        cell,
+        image,
         cv2.COLOR_BGR2GRAY
     )
-
     gray = cv2.resize(
         gray,
         None,
@@ -52,51 +23,30 @@ def ocr(cell, psm=7, whitelist=None):
         fy=2,
         interpolation=cv2.INTER_CUBIC
     )
-
-    config = f"--psm {psm}"
-
-    if whitelist:
-        config += (
-            f" -c tessedit_char_whitelist={whitelist}"
-        )
-
-    return pytesseract.image_to_string(
-        gray,
-        config=config
-    ).strip()
-
-
-def analyze_diagnostic(data):
-
+    return gray
+def analyze(data):
     array = np.frombuffer(
         data,
         np.uint8
     )
-
     img = cv2.imdecode(
         array,
         cv2.IMREAD_COLOR
     )
-
     if img is None:
         raise ValueError(
             "No se pudo leer la imagen"
         )
-
     h, w = img.shape[:2]
-
     x0, y0, x1, y1 = TABLE
-
     table = img[
         int(y0 * h):
         int(y1 * h),
         int(x0 * w):
         int(x1 * w)
     ]
-
     th, tw = table.shape[:2]
-
-    diagnostic = {
+    result = {
         "image_size": {
             "width": w,
             "height": h
@@ -107,201 +57,194 @@ def analyze_diagnostic(data):
         },
         "rows": []
     }
-
-    # ========================================================
-    # ANALYZE EACH POSSIBLE PLAYER ROW
-    # ========================================================
-
     for row_number, row_center in enumerate(
         ROW_Y,
         1
     ):
-
-        # Wider crop for diagnosis so we can see exactly
-        # what OCR is reading.
-        half_height = int(
-            th * 0.10
-        )
-
         center = int(
             th * row_center
         )
-
+        # Relatively narrow crop.
+        # We want one row without neighboring rows.
+        half_height = int(
+            th * 0.075
+        )
         y0r = max(
             0,
             center - half_height
         )
-
         y1r = min(
             th,
             center + half_height
         )
-
-        row_result = {
-            "row": row_number,
-            "row_center": row_center,
-            "raw": {}
-        }
-
+        row = table[
+            y0r:y1r,
+            :
+        ]
+        gray = prepare(row)
         # ====================================================
-        # EACH COLUMN
+        # FULL ROW OCR
         # ====================================================
-
-        for key, (a, b) in COLS.items():
-
-            xa = int(
-                tw * a
-            )
-
-            xb = int(
-                tw * b
-            )
-
-            cell = table[
-                y0r:y1r,
-                xa:xb
-            ]
-
-            if key == "player":
-
-                text = ocr(
-                    cell,
-                    psm=7
-                )
-
-            elif key == "survival":
-
-                # Wider diagnostic crop.
-                xa2 = int(
-                    tw * 0.58
-                )
-
-                xb2 = int(
-                    tw * 0.72
-                )
-
-                cell = table[
-                    y0r:y1r,
-                    xa2:xb2
-                ]
-
-                text = ocr(
-                    cell,
-                    psm=7,
-                    whitelist="0123456789.,"
-                )
-
-            else:
-
-                text = ocr(
-                    cell,
-                    psm=7,
-                    whitelist="0123456789.,"
-                )
-
-            row_result["raw"][key] = text
-
-        diagnostic["rows"].append(
-            row_result
+        data_dict = pytesseract.image_to_data(
+            gray,
+            config="--psm 6",
+            output_type=pytesseract.Output.DICT
         )
-
-    return diagnostic
-
-
+        words = []
+        total = len(
+            data_dict["text"]
+        )
+        for i in range(total):
+            text = str(
+                data_dict["text"][i]
+            ).strip()
+            if not text:
+                continue
+            try:
+                confidence = float(
+                    data_dict["conf"][i]
+                )
+            except Exception:
+                confidence = -1
+            if confidence < 15:
+                continue
+            left = int(
+                data_dict["left"][i]
+            )
+            top = int(
+                data_dict["top"][i]
+            )
+            width = int(
+                data_dict["width"][i]
+            )
+            height = int(
+                data_dict["height"][i]
+            )
+            # Convert the OCR coordinates back from
+            # the 2x enlarged image to the original row.
+            original_x = left / 2
+            original_y = top / 2
+            original_width = width / 2
+            original_height = height / 2
+            words.append(
+                {
+                    "text": text,
+                    "confidence": round(
+                        confidence,
+                        1
+                    ),
+                    "x": round(
+                        original_x,
+                        1
+                    ),
+                    "y": round(
+                        original_y,
+                        1
+                    ),
+                    "width": round(
+                        original_width,
+                        1
+                    ),
+                    "height": round(
+                        original_height,
+                        1
+                    )
+                }
+            )
+        # Sort from left to right.
+        words.sort(
+            key=lambda item: (
+                item["x"],
+                item["y"]
+            )
+        )
+        result["rows"].append(
+            {
+                "row": row_number,
+                "row_center": row_center,
+                "crop": {
+                    "x": 0,
+                    "y": y0r,
+                    "width": tw,
+                    "height": y1r - y0r
+                },
+                "words": words
+            }
+        )
+    return result
 @app.get(
     "/",
     response_class=HTMLResponse
 )
 def home():
-
     return """
     <!DOCTYPE html>
     <html lang="es">
     <head>
         <meta charset="UTF-8">
-        <title>PUBGM OCR Diagnostic</title>
-
+        <meta name="viewport"
+              content="width=device-width,
+                       initial-scale=1.0">
+        <title>PUBGM OCR Diagnostic 2</title>
         <style>
             body {
                 font-family: Arial, sans-serif;
-                max-width: 900px;
-                margin: 40px auto;
+                max-width: 1000px;
+                margin: 30px auto;
                 padding: 20px;
             }
-
             button {
                 padding: 12px 20px;
                 font-size: 16px;
-                cursor: pointer;
             }
-
             pre {
                 background: #111;
                 color: #fff;
                 padding: 20px;
-                overflow-x: auto;
+                border-radius: 8px;
                 white-space: pre-wrap;
+                overflow-x: auto;
             }
         </style>
     </head>
-
     <body>
-
-        <h1>PUBGM OCR Diagnostic</h1>
-
+        <h1>PUBGM OCR Diagnostic 2</h1>
         <p>
-            Sube UNA captura de resultados de PUBG Mobile.
+            Sube UNA captura de resultados.
         </p>
-
         <input
             type="file"
             id="image"
             accept="image/*"
         >
-
         <br><br>
-
-        <button onclick="analyze()">
+        <button onclick="runDiagnostic()">
             Analizar diagnóstico
         </button>
-
-        <h2>Resultado OCR</h2>
-
+        <h2>Resultado</h2>
         <pre id="result">
 Esperando imagen...
         </pre>
-
         <script>
-
-        async function analyze() {
-
+        async function runDiagnostic() {
             const input =
                 document.getElementById("image");
-
-            const result =
+            const output =
                 document.getElementById("result");
-
             if (!input.files.length) {
-
-                result.textContent =
+                output.textContent =
                     "Selecciona una imagen.";
-
                 return;
             }
-
-            result.textContent =
-                "Analizando...";
-
+            output.textContent =
+                "Analizando OCR...";
             const form =
                 new FormData();
-
             form.append(
                 "file",
                 input.files[0]
             );
-
             try {
-
                 const response =
                     await fetch(
                         "/api/diagnostic",
@@ -310,53 +253,36 @@ Esperando imagen...
                             body: form
                         }
                     );
-
                 const data =
                     await response.json();
-
-                result.textContent =
+                output.textContent =
                     JSON.stringify(
                         data,
                         null,
                         2
                     );
-
             } catch (error) {
-
-                result.textContent =
-                    "ERROR: " +
-                    error;
-
+                output.textContent =
+                    "ERROR: " + error;
             }
-
         }
-
         </script>
-
     </body>
     </html>
     """
-
-
 @app.post("/api/diagnostic")
 async def diagnostic(
     file: UploadFile = File(...)
 ):
-
     try:
-
         data = await file.read()
-
-        result = analyze_diagnostic(
+        result = analyze(
             data
         )
-
         return JSONResponse(
             result
         )
-
     except Exception as error:
-
         return JSONResponse(
             {
                 "error": str(error)
