@@ -1,0 +1,117 @@
+
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PUBGM Analytics</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+:root{--bg:#080a0d;--panel:#11151a;--line:#252b33;--muted:#8d97a5;--text:#eef2f7;--accent:#f4b51d;--danger:#ff6b6b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif}
+.app{max-width:1320px;margin:auto;padding:28px}.brand{display:flex;justify-content:space-between;align-items:center;margin-bottom:28px}
+.brand h1{margin:0;font-size:28px}.brand span{color:var(--muted);font-size:13px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:20px;margin-bottom:18px}
+.drop{border:1px dashed #4b5563;border-radius:15px;padding:42px;text-align:center}.drop strong{font-size:18px}
+input{margin:18px 0;color:#ddd}button{border:0;border-radius:10px;padding:12px 18px;font-weight:800;cursor:pointer;background:var(--accent);color:#111}
+button.secondary{background:#20262e;color:#eef2f7;border:1px solid #303743}
+.actions{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}
+.kpis{display:grid;grid-template-columns:repeat(5,1fr);gap:12px}.kpi{padding:16px;background:#0d1014;border-radius:13px}.kpi small{color:var(--muted)}.kpi b{display:block;font-size:27px;margin-top:7px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.chartbox{height:330px}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{color:#aab3bf}
+.scroll{overflow:auto}.warn{color:var(--danger);font-weight:700}.ok{color:#7ee2a8;font-weight:700}
+.badge{padding:4px 8px;border-radius:99px;background:#1b2129;color:#b9c2cd;font-size:11px}
+.edit{background:#0c1014;border:1px solid #313945;color:#fff;border-radius:6px;padding:5px;width:70px}
+@media(max-width:900px){.kpis{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.app{padding:14px}}
+</style>
+</head>
+<body>
+<div class="app">
+<div class="brand"><div><h1>PUBGM ANALYTICS</h1><span>Screenshot → OCR → Match database → Dashboard</span></div><span>MVP v1.0</span></div>
+
+<div class="panel">
+<div class="drop">
+<strong>Sube las capturas de resultados</strong><br>
+<input id="files" type="file" accept="image/*" multiple><br>
+<div class="actions"><button onclick="analyze()">ANALIZAR PARTIDAS</button><button class="secondary" onclick="loadDemo()">CARGAR DEMO</button></div>
+</div>
+</div>
+
+<div id="appout"></div>
+</div>
+
+<script>
+let matches=[], all=[], charts=[];
+function n(v){return v===null||v===undefined||v===""?"":v}
+function esc(s){return String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]))}
+async function analyze(){
+ const fs=document.getElementById("files").files;
+ if(!fs.length)return alert("Selecciona al menos una captura.");
+ const fd=new FormData(); for(const f of fs)fd.append("files",f);
+ document.getElementById("appout").innerHTML='<div class="panel">Analizando OCR…</div>';
+ const r=await fetch("/api/analyze",{method:"POST",body:fd});
+ matches=(await r.json()).matches; render();
+}
+function loadDemo(){
+ matches=[
+ {match:1,map:"Miramar",placement:1,players:[
+ {player:"Roddo*",kills:3,assists:0,damage:247,survival:19.9,hp_recovered:217,rescues:0,return:0,score:75.7},
+ {player:"MPenlboy",kills:1,assists:1,damage:267,survival:17.6,hp_recovered:36,rescues:0,return:0,score:65.4},
+ {player:"MPuniBOSS",kills:2,assists:2,damage:390,survival:20.3,hp_recovered:223,rescues:0,return:0,score:78.0},
+ {player:"MPRayoman",kills:0,assists:2,damage:203,survival:20.1,hp_recovered:196,rescues:0,return:0,score:62.4}]},
+ {match:2,map:"Rondo",placement:14,players:[
+ {player:"MPuniBOSS",kills:0,assists:0,damage:279,survival:10.9,hp_recovered:227,rescues:0,return:1,score:52.5},
+ {player:"MPRayoman",kills:1,assists:0,damage:179,survival:10.8,hp_recovered:133,rescues:0,return:0,score:51.0},
+ {player:"MPenlboy",kills:1,assists:0,damage:292,survival:10.8,hp_recovered:96,rescues:1,return:0,score:59.6}]},
+ {match:3,map:"Erangel",placement:11,players:[
+ {player:"MPuniBOSS",kills:1,assists:0,damage:151,survival:9.9,hp_recovered:128,rescues:0,return:0,score:50.8},
+ {player:"MPyokboss",kills:0,assists:0,damage:33,survival:13.4,hp_recovered:222,rescues:1,return:0,score:48.2},
+ {player:"MPenlboy",kills:1,assists:0,damage:311,survival:13.7,hp_recovered:356,rescues:0,return:0,score:62.3},
+ {player:"MPRayoman",kills:0,assists:0,damage:0,survival:7.7,hp_recovered:0,rescues:0,return:0,score:31.9}]}
+ ];
+ render();
+}
+function flatten(){all=[];matches.forEach(m=>(m.players||[]).forEach(p=>all.push({...p,match:m.match,map:m.map,placement:m.placement})))}
+function avg(a){return a.length?a.reduce((x,y)=>x+(Number(y)||0),0)/a.length:0}
+function render(){
+ flatten();
+ const totalKills=all.reduce((s,r)=>s+(+r.kills||0),0), totalDmg=all.reduce((s,r)=>s+(+r.damage||0),0);
+ const avgScore=avg(all.map(r=>r.score)), avgDmg=avg(all.map(r=>r.damage)), avgSurv=avg(all.map(r=>r.survival));
+ const by={};all.forEach(r=>{if(!by[r.player])by[r.player]={n:0,k:0,d:0,s:0,sc:0};let x=by[r.player];x.n++;x.k+=+r.kills||0;x.d+=+r.damage||0;x.s+=+r.survival||0;x.sc+=+r.score||0});
+ const rank=Object.entries(by).map(([name,x])=>({name,n:x.n,k:x.k,ak:x.k/x.n,ad:x.d/x.n,as:x.s/x.n,asc:x.sc/x.n})).sort((a,b)=>b.asc-a.asc);
+ let h=`<div class="panel"><div class="kpis">
+ <div class="kpi"><small>PARTIDAS</small><b>${matches.length}</b></div>
+ <div class="kpi"><small>KILLS TOTALES</small><b>${totalKills}</b></div>
+ <div class="kpi"><small>DAÑO TOTAL</small><b>${totalDmg}</b></div>
+ <div class="kpi"><small>AVG DAÑO</small><b>${avgDmg.toFixed(1)}</b></div>
+ <div class="kpi"><small>AVG SCORE</small><b>${avgScore.toFixed(1)}</b></div>
+ </div></div>`;
+ h+=`<div class="grid"><div class="panel"><h3>Score medio por jugador</h3><div class="chartbox"><canvas id="score"></canvas></div></div>
+ <div class="panel"><h3>Daño medio por jugador</h3><div class="chartbox"><canvas id="damage"></canvas></div></div></div>`;
+ h+=`<div class="panel"><h3>Revisión de datos OCR</h3><div class="scroll"><table><thead><tr><th>Match</th><th>Mapa</th><th>Jugador</th><th>K</th><th>A</th><th>Daño</th><th>Superv.</th><th>HP</th><th>Rescates</th><th>Return</th><th>Score</th></tr></thead><tbody>`;
+ all.forEach((r,i)=>{h+=`<tr><td>${r.match}</td><td>${esc(r.map)||"—"}</td><td><input class="edit" data-i="${i}" data-k="player" value="${esc(r.player)}"></td>${["kills","assists","damage","survival","hp_recovered","rescues","return","score"].map(k=>`<td><input class="edit" data-i="${i}" data-k="${k}" value="${n(r[k])}"></td>`).join("")}</tr>`});
+ h+=`</tbody></table></div><p class="warn">⚠️ Revisa cualquier campo vacío o dudoso antes de guardar. La corrección manual es parte del diseño de producción.</p>
+ <button onclick="saveEdits()">APLICAR CORRECCIONES</button> <button class="secondary" onclick="downloadCSV()">EXPORTAR CSV</button></div>`;
+ h+=`<div class="panel"><h3>Ranking</h3><div class="scroll"><table><thead><tr><th>#</th><th>Jugador</th><th>Partidas</th><th>Kills</th><th>Kills/partida</th><th>Daño medio</th><th>Score medio</th></tr></thead><tbody>`;
+ rank.forEach((p,i)=>h+=`<tr><td>${i+1}</td><td>${esc(p.name)}</td><td>${p.n}</td><td>${p.k}</td><td>${p.ak.toFixed(2)}</td><td>${p.ad.toFixed(1)}</td><td>${p.asc.toFixed(1)}</td></tr>`);
+ h+=`</tbody></table></div></div>`;
+ document.getElementById("appout").innerHTML=h;
+ charts.forEach(c=>c.destroy());charts=[];
+ charts.push(new Chart(document.getElementById("score"),{type:"bar",data:{labels:rank.map(x=>x.name),datasets:[{label:"Score medio",data:rank.map(x=>x.asc)}]},options:{responsive:true,maintainAspectRatio:false}}));
+ charts.push(new Chart(document.getElementById("damage"),{type:"bar",data:{labels:rank.map(x=>x.name),datasets:[{label:"Daño medio",data:rank.map(x=>x.ad)}]},options:{responsive:true,maintainAspectRatio:false}}));
+}
+function saveEdits(){
+ document.querySelectorAll(".edit").forEach(e=>{let i=+e.dataset.i,k=e.dataset.k,v=e.value;if(["player"].includes(k))all[i][k]=v;else all[i][k]=v===""?null:Number(v)});
+ // Rebuild match arrays from edited flat data
+ matches.forEach(m=>m.players=[]);all.forEach(r=>{let m=matches.find(x=>x.match===r.match);m.players.push({...r})});
+ render();
+}
+function downloadCSV(){
+ flatten();
+ const headers=["Match","Map","Placement","Player","Kills","Assists","Damage","Survival","HP Recovered","Rescues","Return","Score"];
+ const lines=[headers,...all.map(r=>[r.match,r.map,r.placement,r.player,r.kills,r.assists,r.damage,r.survival,r.hp_recovered,r.rescues,r.return,r.score])].map(row=>row.map(v=>`"${String(v??"").replace(/"/g,'""')}"`).join(","));
+ const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["\ufeff"+lines.join("\n")],{type:"text/csv;charset=utf-8"}));a.download="pubgm_matches.csv";a.click();
+}
+</script>
+</body>
+</html>
