@@ -3,15 +3,16 @@ import pytesseract
 import numpy as np
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
-app = FastAPI(title="PUBGM OCR Diagnostic 2")
+app = FastAPI(title="PUBGM OCR Diagnostic 3")
 TABLE = (0.21, 0.47, 0.80, 0.695)
+# Posiciones aproximadas actuales.
 ROW_Y = [
     0.26,
     0.445,
     0.625,
     0.81,
 ]
-def prepare(image):
+def prepare(image, threshold=False):
     gray = cv2.cvtColor(
         image,
         cv2.COLOR_BGR2GRAY
@@ -23,7 +24,20 @@ def prepare(image):
         fy=2,
         interpolation=cv2.INTER_CUBIC
     )
+    if threshold:
+        gray = cv2.threshold(
+            gray,
+            0,
+            255,
+            cv2.THRESH_BINARY +
+            cv2.THRESH_OTSU
+        )[1]
     return gray
+def run_ocr(image, psm):
+    return pytesseract.image_to_string(
+        image,
+        config=f"--psm {psm}"
+    ).strip()
 def analyze(data):
     array = np.frombuffer(
         data,
@@ -57,118 +71,125 @@ def analyze(data):
         },
         "rows": []
     }
-    for row_number, row_center in enumerate(
+    # --------------------------------------------------------
+    # Test several vertical positions around each expected row.
+    # --------------------------------------------------------
+    offsets = [
+        -0.045,
+        -0.025,
+        -0.010,
+        0.000,
+        0.010,
+        0.025,
+        0.045
+    ]
+    for row_number, base in enumerate(
         ROW_Y,
         1
     ):
-        center = int(
-            th * row_center
-        )
-        # Relatively narrow crop.
-        # We want one row without neighboring rows.
-        half_height = int(
-            th * 0.075
-        )
-        y0r = max(
-            0,
-            center - half_height
-        )
-        y1r = min(
-            th,
-            center + half_height
-        )
-        row = table[
-            y0r:y1r,
-            :
-        ]
-        gray = prepare(row)
-        # ====================================================
-        # FULL ROW OCR
-        # ====================================================
-        data_dict = pytesseract.image_to_data(
-            gray,
-            config="--psm 6",
-            output_type=pytesseract.Output.DICT
-        )
-        words = []
-        total = len(
-            data_dict["text"]
-        )
-        for i in range(total):
-            text = str(
-                data_dict["text"][i]
-            ).strip()
-            if not text:
-                continue
-            try:
-                confidence = float(
-                    data_dict["conf"][i]
-                )
-            except Exception:
-                confidence = -1
-            if confidence < 15:
-                continue
-            left = int(
-                data_dict["left"][i]
+        tests = []
+        for offset in offsets:
+            center_relative = (
+                base + offset
             )
-            top = int(
-                data_dict["top"][i]
+            center = int(
+                th * center_relative
             )
-            width = int(
-                data_dict["width"][i]
+            half_height = int(
+                th * 0.055
             )
-            height = int(
-                data_dict["height"][i]
+            ya = max(
+                0,
+                center - half_height
             )
-            # Convert the OCR coordinates back from
-            # the 2x enlarged image to the original row.
-            original_x = left / 2
-            original_y = top / 2
-            original_width = width / 2
-            original_height = height / 2
-            words.append(
+            yb = min(
+                th,
+                center + half_height
+            )
+            # ------------------------------------------------
+            # NAME ONLY
+            # ------------------------------------------------
+            name_cell = table[
+                ya:yb,
+                0:int(tw * 0.30)
+            ]
+            normal = prepare(
+                name_cell,
+                False
+            )
+            threshold = prepare(
+                name_cell,
+                True
+            )
+            normal_psm7 = run_ocr(
+                normal,
+                7
+            )
+            normal_psm11 = run_ocr(
+                normal,
+                11
+            )
+            threshold_psm7 = run_ocr(
+                threshold,
+                7
+            )
+            threshold_psm11 = run_ocr(
+                threshold,
+                11
+            )
+            # ------------------------------------------------
+            # FULL ROW
+            # ------------------------------------------------
+            row_cell = table[
+                ya:yb,
+                :
+            ]
+            row_normal = prepare(
+                row_cell,
+                False
+            )
+            full_psm6 = run_ocr(
+                row_normal,
+                6
+            )
+            full_psm11 = run_ocr(
+                row_normal,
+                11
+            )
+            tests.append(
                 {
-                    "text": text,
-                    "confidence": round(
-                        confidence,
-                        1
+                    "offset": offset,
+                    "center": round(
+                        center_relative,
+                        4
                     ),
-                    "x": round(
-                        original_x,
-                        1
-                    ),
-                    "y": round(
-                        original_y,
-                        1
-                    ),
-                    "width": round(
-                        original_width,
-                        1
-                    ),
-                    "height": round(
-                        original_height,
-                        1
-                    )
+                    "crop": {
+                        "y": ya,
+                        "height": yb - ya
+                    },
+                    "name": {
+                        "normal_psm7":
+                            normal_psm7,
+                        "normal_psm11":
+                            normal_psm11,
+                        "threshold_psm7":
+                            threshold_psm7,
+                        "threshold_psm11":
+                            threshold_psm11
+                    },
+                    "full_row": {
+                        "psm6":
+                            full_psm6,
+                        "psm11":
+                            full_psm11
+                    }
                 }
             )
-        # Sort from left to right.
-        words.sort(
-            key=lambda item: (
-                item["x"],
-                item["y"]
-            )
-        )
         result["rows"].append(
             {
                 "row": row_number,
-                "row_center": row_center,
-                "crop": {
-                    "x": 0,
-                    "y": y0r,
-                    "width": tw,
-                    "height": y1r - y0r
-                },
-                "words": words
+                "base": base,
+                "tests": tests
             }
         )
     return result
@@ -185,7 +206,7 @@ def home():
         <meta name="viewport"
               content="width=device-width,
                        initial-scale=1.0">
-        <title>PUBGM OCR Diagnostic 2</title>
+        <title>PUBGM OCR Diagnostic 3</title>
         <style>
             body {
                 font-family: Arial, sans-serif;
@@ -199,7 +220,7 @@ def home():
             }
             pre {
                 background: #111;
-                color: #fff;
+                color: white;
                 padding: 20px;
                 border-radius: 8px;
                 white-space: pre-wrap;
@@ -208,9 +229,9 @@ def home():
         </style>
     </head>
     <body>
-        <h1>PUBGM OCR Diagnostic 2</h1>
+        <h1>PUBGM OCR Diagnostic 3</h1>
         <p>
-            Sube UNA captura de resultados.
+            Sube UNA captura de resultados de PUBG Mobile.
         </p>
         <input
             type="file"
@@ -237,7 +258,7 @@ Esperando imagen...
                 return;
             }
             output.textContent =
-                "Analizando OCR...";
+                "Analizando...";
             const form =
                 new FormData();
             form.append(
