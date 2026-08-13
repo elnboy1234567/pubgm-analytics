@@ -8,7 +8,7 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from rapidocr_onnxruntime import RapidOCR
+from paddleocr import PaddleOCR
 
 
 app = FastAPI(title="PUBGM Analytics")
