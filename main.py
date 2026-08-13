@@ -1,62 +1,92 @@
 import re
+import unicodedata
+from typing import List, Dict, Any, Optional
+
 import cv2
 import numpy as np
 
-from typing import List
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
+
+from rapidocr_onnxruntime import RapidOCR
+
+
+app = FastAPI(title="PUBGM Analytics")
 
 # ============================================================
 # RAPIDOCR
 # ============================================================
 
-try:
-    from rapidocr_onnxruntime import RapidOCR
-
-    OCR_ENGINE = RapidOCR()
-    RAPIDOCR_AVAILABLE = True
-
-except Exception:
-    OCR_ENGINE = None
-    RAPIDOCR_AVAILABLE = False
-
-
-# ============================================================
-# APP
-# ============================================================
-
-app = FastAPI(
-    title="PUBGM Analytics"
-)
+ocr = RapidOCR()
 
 
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
 
-MIN_PLAYERS = 2
-MAX_PLAYERS = 4
+MIN_OCR_SCORE = 0.35
 
-NORMALIZED_WIDTH = 1200
-NORMALIZED_HEIGHT = 320
+# Palabras que pueden aparecer dentro de la tabla pero
+# NO son nombres de jugadores.
+BAD_PLAYER_WORDS = {
+    "experto",
+    "tactico",
+    "tactical",
+    "expert",
+    "wild",
+    "shot",
+    "cannon",
+    "fodder",
+    "too",
+    "soon",
+    "personal",
+    "info",
+}
 
-# Columnas relativas dentro de la tabla normalizada.
-#
-# PUBG mantiene prácticamente la misma estructura interna
-# aunque cambie la resolución o el dispositivo.
-#
-# Se han definido como límites, NO como coordenadas de pantalla.
-
-COLUMN_RATIOS = {
-    "player": (0.00, 0.365),
-    "kills": (0.365, 0.435),
-    "assists": (0.435, 0.505),
-    "damage": (0.505, 0.585),
-    "survival": (0.585, 0.655),
-    "hp_recovered": (0.655, 0.755),
-    "rescues": (0.755, 0.835),
-    "return": (0.835, 0.915),
-    "score": (0.915, 1.000),
+HEADER_ALIASES = {
+    "player": [
+        "nombre",
+        "name",
+    ],
+    "kills": [
+        "eliminaciones",
+        "eliminations",
+        "kills",
+    ],
+    "assists": [
+        "asistencias",
+        "assists",
+    ],
+    "damage": [
+        "daño",
+        "dano",
+        "damage",
+    ],
+    "survival": [
+        "supervivencia",
+        "survived",
+        "survival",
+    ],
+    "hp_recovered": [
+        "vida",
+        "health",
+        "restored",
+        "recup",
+        "recovered",
+    ],
+    "rescues": [
+        "rescates",
+        "rescue",
+    ],
+    "return": [
+        "regresar",
+        "recall",
+    ],
+    "score": [
+        "puntaje",
+        "rating",
+        "score",
+    ],
 }
 
 
@@ -64,47 +94,656 @@ COLUMN_RATIOS = {
 # UTILIDADES
 # ============================================================
 
-def clean_spaces(text):
-
+def normalize_text(text: str) -> str:
     if not text:
         return ""
 
-    return re.sub(
+    text = str(text).lower().strip()
+
+    text = unicodedata.normalize(
+        "NFD",
+        text
+    )
+
+    text = "".join(
+        c for c in text
+        if unicodedata.category(c) != "Mn"
+    )
+
+    text = re.sub(
         r"\s+",
         " ",
-        str(text)
-    ).strip()
+        text
+    )
+
+    return text.strip()
 
 
-def normalize_text(text):
-
+def clean_player_name(text: str) -> str:
     if not text:
         return ""
 
-    text = str(text).lower()
+    text = str(text).strip()
 
-    replacements = {
-        "á": "a",
-        "é": "e",
-        "í": "i",
-        "ó": "o",
-        "ú": "u",
-        "ü": "u",
-    }
+    # Quitar espacios internos extra
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
 
-    for old, new in replacements.items():
-        text = text.replace(
-            old,
-            new
+    # Caracteres de borde típicamente introducidos
+    # por OCR.
+    text = re.sub(
+        r"^[|Il!]+",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"[|]+$",
+        "",
+        text
+    )
+
+    return text.strip()
+
+
+def is_bad_player_text(text: str) -> bool:
+    normalized = normalize_text(text)
+
+    if not normalized:
+        return True
+
+    if len(normalized) < 3:
+        return True
+
+    if normalized in BAD_PLAYER_WORDS:
+        return True
+
+    # No aceptar solamente números.
+    if re.fullmatch(
+        r"[\d\s.,:]+",
+        normalized
+    ):
+        return True
+
+    # Textos claramente pertenecientes a la interfaz.
+    interface_words = [
+        "nombre",
+        "name",
+        "eliminaciones",
+        "eliminations",
+        "asistencias",
+        "assists",
+        "damage",
+        "dano",
+        "supervivencia",
+        "survived",
+        "vida",
+        "health",
+        "rescates",
+        "rescue",
+        "regresar",
+        "recall",
+        "puntaje",
+        "rating",
+        "score",
+    ]
+
+    if normalized in interface_words:
+        return True
+
+    return False
+
+
+# ============================================================
+# OCR
+# ============================================================
+
+def run_ocr(image):
+    """
+    Ejecuta RapidOCR.
+
+    Se utiliza detección + reconocimiento para obtener:
+        texto
+        confianza
+        coordenadas
+    """
+
+    result = ocr(image)
+
+    # rapidocr_onnxruntime 1.x normalmente devuelve:
+    #
+    # result, elapse_list
+    #
+    # Pero dejamos compatibilidad con otras formas de retorno.
+
+    if isinstance(result, tuple):
+        result = result[0]
+
+    return parse_ocr_result(result)
+
+
+def parse_ocr_result(result):
+    """
+    Normaliza diferentes formatos de RapidOCR
+    a:
+
+    [
+        {
+            "text": "...",
+            "score": 0.99,
+            "box": [[x,y],...],
+            "cx": ...,
+            "cy": ...,
+            "x0": ...,
+            "x1": ...,
+            "y0": ...,
+            "y1": ...
+        }
+    ]
+    """
+
+    output = []
+
+    if result is None:
+        return output
+
+    # API nueva: objeto con .boxes .txts .scores
+    if hasattr(result, "boxes"):
+
+        boxes = result.boxes
+        texts = result.txts
+        scores = result.scores
+
+        if boxes is None:
+            return output
+
+        for box, text, score in zip(
+            boxes,
+            texts,
+            scores
+        ):
+            add_detection(
+                output,
+                box,
+                text,
+                score
+            )
+
+        return output
+
+    # API clásica:
+    # [
+    #   [box, text, score],
+    #   ...
+    # ]
+    try:
+        for item in result:
+
+            if len(item) < 3:
+                continue
+
+            box = item[0]
+            text = item[1]
+            score = item[2]
+
+            add_detection(
+                output,
+                box,
+                text,
+                score
+            )
+
+    except Exception:
+        pass
+
+    return output
+
+
+def add_detection(
+    output,
+    box,
+    text,
+    score
+):
+    try:
+
+        score = float(score)
+
+        if score < MIN_OCR_SCORE:
+            return
+
+        box_array = np.asarray(
+            box,
+            dtype=float
         )
 
-    return text
+        if box_array.ndim != 2:
+            return
+
+        xs = box_array[:, 0]
+        ys = box_array[:, 1]
+
+        x0 = float(np.min(xs))
+        x1 = float(np.max(xs))
+        y0 = float(np.min(ys))
+        y1 = float(np.max(ys))
+
+        output.append(
+            {
+                "text": str(text).strip(),
+                "score": score,
+                "box": box_array.tolist(),
+                "cx": (x0 + x1) / 2,
+                "cy": (y0 + y1) / 2,
+                "x0": x0,
+                "x1": x1,
+                "y0": y0,
+                "y1": y1,
+                "width": x1 - x0,
+                "height": y1 - y0,
+            }
+        )
+
+    except Exception:
+        pass
 
 
-def numeric_cleanup(text):
+# ============================================================
+# IMAGEN
+# ============================================================
 
-    if not text:
-        return ""
+def decode_image(data: bytes):
+
+    array = np.frombuffer(
+        data,
+        np.uint8
+    )
+
+    image = cv2.imdecode(
+        array,
+        cv2.IMREAD_COLOR
+    )
+
+    if image is None:
+        raise ValueError(
+            "No se pudo leer la imagen"
+        )
+
+    return image
+
+
+def resize_for_ocr(image):
+
+    h, w = image.shape[:2]
+
+    # RapidOCR funciona mejor manteniendo
+    # suficiente resolución para textos pequeños.
+    #
+    # Para capturas de móvil/tablet muy grandes
+    # reducimos solamente si es necesario.
+
+    max_dimension = 2200
+
+    largest = max(
+        h,
+        w
+    )
+
+    if largest <= max_dimension:
+        return image, 1.0
+
+    scale = (
+        max_dimension /
+        float(largest)
+    )
+
+    resized = cv2.resize(
+        image,
+        None,
+        fx=scale,
+        fy=scale,
+        interpolation=cv2.INTER_AREA
+    )
+
+    return resized, scale
+
+
+# ============================================================
+# ENCABEZADOS
+# ============================================================
+
+def header_matches(text, aliases):
+
+    normalized = normalize_text(text)
+
+    for alias in aliases:
+
+        alias = normalize_text(
+            alias
+        )
+
+        if alias in normalized:
+            return True
+
+    return False
+
+
+def find_header_detections(
+    detections
+):
+
+    headers = {}
+
+    for detection in detections:
+
+        text = detection["text"]
+
+        for key, aliases in HEADER_ALIASES.items():
+
+            if header_matches(
+                text,
+                aliases
+            ):
+
+                if key not in headers:
+                    headers[key] = []
+
+                headers[key].append(
+                    detection
+                )
+
+    return headers
+
+
+def get_header_y(headers):
+
+    ys = []
+
+    for detections in headers.values():
+
+        for detection in detections:
+
+            ys.append(
+                detection["cy"]
+            )
+
+    if not ys:
+        return None
+
+    return float(
+        np.median(ys)
+    )
+
+
+# ============================================================
+# COLUMNAS
+# ============================================================
+
+def build_columns(
+    headers,
+    image_width
+):
+
+    columns = {}
+
+    # Si RapidOCR ha encontrado los encabezados,
+    # usamos sus posiciones REALES.
+    for key, detections in headers.items():
+
+        if not detections:
+            continue
+
+        x_values = [
+            d["cx"]
+            for d in detections
+        ]
+
+        columns[key] = float(
+            np.median(x_values)
+        )
+
+    # Si algún encabezado no ha sido reconocido,
+    # estimamos su posición basándonos en la estructura
+    # de PUBG.
+    #
+    # Esto es solo un fallback.
+    if "player" not in columns:
+        columns["player"] = image_width * 0.08
+
+    fallback = {
+        "kills": 0.36,
+        "assists": 0.42,
+        "damage": 0.49,
+        "survival": 0.56,
+        "hp_recovered": 0.64,
+        "rescues": 0.73,
+        "return": 0.81,
+        "score": 0.91,
+    }
+
+    for key, ratio in fallback.items():
+
+        if key not in columns:
+            columns[key] = (
+                image_width * ratio
+            )
+
+    return columns
+
+
+def column_boundaries(
+    columns,
+    image_width
+):
+
+    ordered = sorted(
+        columns.items(),
+        key=lambda x: x[1]
+    )
+
+    boundaries = {}
+
+    for index, (name, center) in enumerate(
+        ordered
+    ):
+
+        if index == 0:
+            left = 0
+        else:
+            previous_center = (
+                ordered[index - 1][1]
+            )
+
+            left = (
+                previous_center +
+                center
+            ) / 2
+
+        if index == len(ordered) - 1:
+            right = image_width
+        else:
+            next_center = (
+                ordered[index + 1][1]
+            )
+
+            right = (
+                center +
+                next_center
+            ) / 2
+
+        boundaries[name] = (
+            left,
+            right
+        )
+
+    return boundaries
+
+
+def detect_column(
+    x,
+    boundaries
+):
+
+    for name, (
+        left,
+        right
+    ) in boundaries.items():
+
+        if (
+            left <= x <= right
+        ):
+            return name
+
+    return None
+
+
+# ============================================================
+# FILAS
+# ============================================================
+
+def group_rows(
+    detections,
+    header_y,
+    image_height
+):
+
+    if header_y is None:
+        return []
+
+    # Solamente texto debajo de los encabezados.
+    candidates = []
+
+    for detection in detections:
+
+        cy = detection["cy"]
+
+        # Evitar el encabezado.
+        if cy <= header_y + 15:
+            continue
+
+        # Evitar elementos muy inferiores
+        # como logos/botones.
+        if cy >= image_height * 0.88:
+            continue
+
+        candidates.append(
+            detection
+        )
+
+    if not candidates:
+        return []
+
+    # Orden vertical.
+    candidates.sort(
+        key=lambda d: d["cy"]
+    )
+
+    # Agrupación dinámica.
+    rows = []
+
+    for detection in candidates:
+
+        added = False
+
+        for row in rows:
+
+            row_center = np.mean(
+                [
+                    d["cy"]
+                    for d in row
+                ]
+            )
+
+            # Tolerancia proporcional al tamaño
+            # del texto.
+            tolerance = max(
+                18,
+                detection["height"] * 1.8
+            )
+
+            if abs(
+                detection["cy"] -
+                row_center
+            ) <= tolerance:
+
+                row.append(
+                    detection
+                )
+
+                added = True
+                break
+
+        if not added:
+
+            rows.append(
+                [detection]
+            )
+
+    # Ordenar filas.
+    rows.sort(
+        key=lambda row:
+        np.mean(
+            [d["cy"] for d in row]
+        )
+    )
+
+    # Fusionar filas que han quedado separadas
+    # accidentalmente.
+    merged = []
+
+    for row in rows:
+
+        if not merged:
+
+            merged.append(
+                row
+            )
+            continue
+
+        previous = merged[-1]
+
+        previous_center = np.mean(
+            [
+                d["cy"]
+                for d in previous
+            ]
+        )
+
+        current_center = np.mean(
+            [
+                d["cy"]
+                for d in row
+            ]
+        )
+
+        if abs(
+            current_center -
+            previous_center
+        ) < 30:
+
+            previous.extend(
+                row
+            )
+
+        else:
+
+            merged.append(
+                row
+            )
+
+    return merged
+
+
+# ============================================================
+# NÚMEROS
+# ============================================================
+
+def normalize_number_text(
+    text
+):
 
     text = str(text)
 
@@ -118,6 +757,7 @@ def numeric_cleanup(text):
         "B": "8",
         "G": "6",
         "q": "9",
+        "Z": "2",
     }
 
     for old, new in replacements.items():
@@ -129,728 +769,17 @@ def numeric_cleanup(text):
     return text
 
 
-# ============================================================
-# RAPIDOCR
-# ============================================================
-
-def run_ocr(image):
-
-    if not RAPIDOCR_AVAILABLE:
-        return []
-
-    if image is None:
-        return []
-
-    if image.size == 0:
-        return []
-
-    try:
-
-        result, _ = OCR_ENGINE(
-            image
-        )
-
-    except Exception:
-        return []
-
-    if not result:
-        return []
-
-    output = []
-
-    for item in result:
-
-        try:
-
-            box = item[0]
-            text = clean_spaces(
-                item[1]
-            )
-            confidence = float(
-                item[2]
-            )
-
-        except Exception:
-            continue
-
-        if not text:
-            continue
-
-        if confidence < 0.25:
-            continue
-
-        xs = [
-            int(point[0])
-            for point in box
-        ]
-
-        ys = [
-            int(point[1])
-            for point in box
-        ]
-
-        x0 = min(xs)
-        x1 = max(xs)
-        y0 = min(ys)
-        y1 = max(ys)
-
-        output.append(
-            {
-                "text": text,
-                "confidence": confidence,
-                "x0": x0,
-                "y0": y0,
-                "x1": x1,
-                "y1": y1,
-                "cx": (x0 + x1) / 2,
-                "cy": (y0 + y1) / 2,
-            }
-        )
-
-    return output
-
-
-# ============================================================
-# DETECTAR PANEL DE RESULTADOS
-# ============================================================
-
-def detect_result_panel(image):
-
-    h, w = image.shape[:2]
-
-    gray = cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2GRAY
-    )
-
-    # --------------------------------------------------------
-    # Buscamos zonas oscuras grandes.
-    # La tabla de PUBG es una de las zonas más oscuras
-    # y estructuradas de la pantalla.
-    # --------------------------------------------------------
-
-    blurred = cv2.GaussianBlur(
-        gray,
-        (9, 9),
-        0
-    )
-
-    dark = cv2.threshold(
-        blurred,
-        105,
-        255,
-        cv2.THRESH_BINARY_INV
-    )[1]
-
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT,
-        (25, 9)
-    )
-
-    dark = cv2.morphologyEx(
-        dark,
-        cv2.MORPH_CLOSE,
-        kernel
-    )
-
-    contours, _ = cv2.findContours(
-        dark,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
+def extract_integer(
+    texts,
+    maximum
+):
 
     candidates = []
 
-    for contour in contours:
+    for text in texts:
 
-        x, y, cw, ch = cv2.boundingRect(
-            contour
-        )
-
-        area = cw * ch
-
-        if area < w * h * 0.04:
-            continue
-
-        ratio = cw / max(
-            ch,
-            1
-        )
-
-        # El panel es claramente horizontal.
-        if ratio < 1.5:
-            continue
-
-        if cw < w * 0.45:
-            continue
-
-        candidates.append(
-            (
-                area,
-                x,
-                y,
-                cw,
-                ch
-            )
-        )
-
-    if candidates:
-
-        # Preferimos la región grande y horizontal.
-        candidates.sort(
-            reverse=True
-        )
-
-        _, x, y, cw, ch = candidates[0]
-
-        # Añadir margen.
-        pad_x = int(cw * 0.01)
-        pad_y = int(ch * 0.01)
-
-        x0 = max(
-            0,
-            x - pad_x
-        )
-
-        y0 = max(
-            0,
-            y - pad_y
-        )
-
-        x1 = min(
-            w,
-            x + cw + pad_x
-        )
-
-        y1 = min(
-            h,
-            y + ch + pad_y
-        )
-
-        return (
-            x0,
-            y0,
-            x1,
-            y1
-        )
-
-    return None
-
-
-# ============================================================
-# ENCONTRAR ENCABEZADO
-# ============================================================
-
-HEADER_WORDS = [
-    "name",
-    "nombre",
-    "eliminations",
-    "eliminaciones",
-    "assists",
-    "asistencias",
-    "damage",
-    "daño",
-    "dano",
-    "survived",
-    "supervivencia",
-    "rating",
-    "puntaje",
-]
-
-
-def header_score(
-    text
-):
-
-    text = normalize_text(
-        text
-    )
-
-    best = 0
-
-    for word in HEADER_WORDS:
-
-        if text == word:
-            best = max(
-                best,
-                1.0
-            )
-            continue
-
-        if word in text:
-            best = max(
-                best,
-                0.75
-            )
-
-    return best
-
-
-def find_header(
-    ocr,
-    panel
-):
-
-    px0, py0, px1, py1 = panel
-
-    candidates = []
-
-    for item in ocr:
-
-        if item["cx"] < px0:
-            continue
-
-        if item["cx"] > px1:
-            continue
-
-        if item["cy"] < py0:
-            continue
-
-        if item["cy"] > py1:
-            continue
-
-        score = header_score(
-            item["text"]
-        )
-
-        if score <= 0:
-            continue
-
-        candidates.append(
-            (
-                score,
-                item
-            )
-        )
-
-    if not candidates:
-        return None
-
-    # Preferimos "Nombre"/"Name".
-    name_candidates = []
-
-    for score, item in candidates:
-
-        text = normalize_text(
-            item["text"]
-        )
-
-        if (
-            text == "name"
-            or
-            text == "nombre"
-        ):
-            name_candidates.append(
-                (
-                    score,
-                    item
-                )
-            )
-
-    if name_candidates:
-
-        name_candidates.sort(
-            key=lambda x: x[1]["cy"]
-        )
-
-        return name_candidates[0][1]
-
-    candidates.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    return candidates[0][1]
-
-
-# ============================================================
-# NORMALIZAR PANEL
-# ============================================================
-
-def normalize_panel(
-    image,
-    panel
-):
-
-    x0, y0, x1, y1 = panel
-
-    crop = image[
-        y0:y1,
-        x0:x1
-    ]
-
-    if crop.size == 0:
-        return None
-
-    normalized = cv2.resize(
-        crop,
-        (
-            NORMALIZED_WIDTH,
-            NORMALIZED_HEIGHT
-        ),
-        interpolation=cv2.INTER_CUBIC
-    )
-
-    return normalized
-
-
-# ============================================================
-# DETECTAR FILAS
-# ============================================================
-
-def detect_rows(
-    normalized
-):
-
-    gray = cv2.cvtColor(
-        normalized,
-        cv2.COLOR_BGR2GRAY
-    )
-
-    # --------------------------------------------------------
-    # El encabezado es negro.
-    # Las filas tienen texto claro.
-    #
-    # Buscamos concentración horizontal de píxeles claros.
-    # --------------------------------------------------------
-
-    bright = cv2.threshold(
-        gray,
-        160,
-        255,
-        cv2.THRESH_BINARY
-    )[1]
-
-    # Ignorar aproximadamente el encabezado.
-    search = bright[
-        int(NORMALIZED_HEIGHT * 0.28):
-        int(NORMALIZED_HEIGHT * 0.98),
-        :
-    ]
-
-    projection = np.sum(
-        search > 0,
-        axis=1
-    )
-
-    # Suavizar.
-    kernel = np.ones(
-        7,
-        dtype=np.float32
-    ) / 7
-
-    projection = np.convolve(
-        projection,
-        kernel,
-        mode="same"
-    )
-
-    # Umbral adaptativo.
-    threshold = max(
-        np.percentile(
-            projection,
-            65
-        ),
-        10
-    )
-
-    active = projection > threshold
-
-    groups = []
-
-    start = None
-
-    for i, value in enumerate(
-        active
-    ):
-
-        if value and start is None:
-
-            start = i
-
-        elif (
-            not value
-            and
-            start is not None
-        ):
-
-            if i - start >= 3:
-
-                groups.append(
-                    (
-                        start,
-                        i
-                    )
-                )
-
-            start = None
-
-    if start is not None:
-
-        groups.append(
-            (
-                start,
-                len(active)
-            )
-        )
-
-    centers = []
-
-    offset = int(
-        NORMALIZED_HEIGHT * 0.28
-    )
-
-    for start, end in groups:
-
-        center = int(
-            (
-                start
-                + end
-            ) / 2
-        )
-
-        center += offset
-
-        centers.append(
-            center
-        )
-
-    # --------------------------------------------------------
-    # Agrupar centros demasiado cercanos.
-    # --------------------------------------------------------
-
-    filtered = []
-
-    for center in centers:
-
-        if not filtered:
-
-            filtered.append(
-                center
-            )
-
-            continue
-
-        if (
-            center
-            - filtered[-1]
-            < 22
-        ):
-
-            filtered[-1] = int(
-                (
-                    filtered[-1]
-                    + center
-                ) / 2
-            )
-
-        else:
-
-            filtered.append(
-                center
-            )
-
-    # --------------------------------------------------------
-    # Normalmente tenemos 4 jugadores.
-    # Si hay ruido, nos quedamos con los centros
-    # más regularmente separados.
-    # --------------------------------------------------------
-
-    if len(filtered) > MAX_PLAYERS:
-
-        candidates = []
-
-        for i in range(
-            len(filtered)
-            - MAX_PLAYERS
-            + 1
-        ):
-
-            subset = filtered[
-                i:i + MAX_PLAYERS
-            ]
-
-            gaps = np.diff(
-                subset
-            )
-
-            if len(gaps) == 0:
-                continue
-
-            variation = np.std(
-                gaps
-            )
-
-            candidates.append(
-                (
-                    variation,
-                    subset
-                )
-            )
-
-        if candidates:
-
-            candidates.sort(
-                key=lambda x: x[0]
-            )
-
-            filtered = candidates[0][1]
-
-    if (
-        len(filtered)
-        < MIN_PLAYERS
-    ):
-        return []
-
-    return filtered
-
-
-# ============================================================
-# CORTAR CELDA
-# ============================================================
-
-def crop_cell(
-    table,
-    row_center,
-    column
-):
-
-    x0 = int(
-        NORMALIZED_WIDTH
-        * column[0]
-    )
-
-    x1 = int(
-        NORMALIZED_WIDTH
-        * column[1]
-    )
-
-    # --------------------------------------------------------
-    # Cada fila tiene margen vertical.
-    # --------------------------------------------------------
-
-    row_height = 47
-
-    y0 = max(
-        0,
-        int(
-            row_center
-            - row_height / 2
-        )
-    )
-
-    y1 = min(
-        NORMALIZED_HEIGHT,
-        int(
-            row_center
-            + row_height / 2
-        )
-    )
-
-    cell = table[
-        y0:y1,
-        x0:x1
-    ]
-
-    return cell
-
-
-# ============================================================
-# LEER NOMBRE
-# ============================================================
-
-def clean_player(
-    text
-):
-
-    if not text:
-        return ""
-
-    text = clean_spaces(
-        text
-    )
-
-    # El OCR puede devolver elementos
-    # del borde de la celda.
-    text = text.strip(
-        "|[]{}()"
-    )
-
-    # Mantener caracteres habituales
-    # de nombres PUBG.
-    text = re.sub(
-        r"[^A-Za-z0-9_.*\-]+",
-        "",
-        text
-    )
-
-    return text
-
-
-def read_player(
-    cell
-):
-
-    ocr = run_ocr(
-        cell
-    )
-
-    candidates = []
-
-    for item in ocr:
-
-        text = clean_player(
-            item["text"]
-        )
-
-        if len(text) < 3:
-            continue
-
-        # No aceptar únicamente números.
-        if re.fullmatch(
-            r"\d+",
+        text = normalize_number_text(
             text
-        ):
-            continue
-
-        candidates.append(
-            (
-                item["confidence"],
-                text
-            )
-        )
-
-    if not candidates:
-        return None
-
-    candidates.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    return candidates[0][1]
-
-
-# ============================================================
-# LEER ENTERO
-# ============================================================
-
-def read_integer(
-    cell,
-    minimum=0,
-    maximum=9999
-):
-
-    ocr = run_ocr(
-        cell
-    )
-
-    values = []
-
-    for item in ocr:
-
-        text = numeric_cleanup(
-            item["text"]
         )
 
         matches = re.findall(
@@ -861,59 +790,66 @@ def read_integer(
         for match in matches:
 
             try:
+
                 value = int(
                     match
                 )
-            except Exception:
-                continue
 
-            if (
-                minimum
-                <= value
-                <= maximum
-            ):
-
-                values.append(
-                    (
-                        item["confidence"],
+                if (
+                    0 <= value <= maximum
+                ):
+                    candidates.append(
                         value
                     )
-                )
 
-    if not values:
+            except Exception:
+                pass
+
+    if not candidates:
         return None
 
-    # Mejor confianza primero.
-    values.sort(
-        key=lambda x: x[0],
-        reverse=True
+    # Para una celda debería existir
+    # normalmente un único número.
+    #
+    # Si hay varios, damos prioridad
+    # al valor con más apariciones.
+    counts = {}
+
+    for value in candidates:
+
+        counts[value] = (
+            counts.get(
+                value,
+                0
+            ) + 1
+        )
+
+    return max(
+        counts,
+        key=counts.get
     )
 
-    return values[0][1]
 
-
-# ============================================================
-# LEER PUNTUACIÓN
-# ============================================================
-
-def read_score(
-    cell
+def extract_decimal(
+    texts,
+    maximum
 ):
 
-    ocr = run_ocr(
-        cell
-    )
+    candidates = []
 
-    values = []
+    for text in texts:
 
-    for item in ocr:
+        text = normalize_number_text(
+            text
+        )
 
-        text = numeric_cleanup(
-            item["text"]
+        text = text.replace(
+            ",",
+            "."
         )
 
         matches = re.findall(
-            r"\d+(?:[.,]\d+)?",
+            r"\d+(?:\.\d+)?",
             text
         )
 
@@ -922,239 +858,268 @@ def read_score(
             try:
 
                 value = float(
-                    match.replace(
-                        ",",
-                        "."
-                    )
-                )
-
-            except Exception:
-                continue
-
-            if 0 <= value <= 150:
-
-                values.append(
-                    (
-                        item["confidence"],
-                        value
-                    )
-                )
-
-    if not values:
-        return None
-
-    values.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    return values[0][1]
-
-
-# ============================================================
-# LEER SUPERVIVENCIA
-# ============================================================
-
-def read_survival(
-    cell
-):
-
-    ocr = run_ocr(
-        cell
-    )
-
-    values = []
-
-    for item in ocr:
-
-        text = numeric_cleanup(
-            item["text"]
-        )
-
-        matches = re.findall(
-            r"(\d{1,2})[:.](\d{1,2})",
-            text
-        )
-
-        for minutes, seconds in matches:
-
-            try:
-
-                m = int(
-                    minutes
-                )
-
-                s = int(
-                    seconds
+                    match
                 )
 
                 if (
-                    0 <= m <= 60
-                    and
-                    0 <= s < 60
+                    0 <= value <= maximum
                 ):
-
-                    values.append(
-                        (
-                            item["confidence"],
-                            f"{m}:{s:02d}"
-                        )
+                    candidates.append(
+                        value
                     )
 
             except Exception:
                 pass
 
-    if not values:
+    if not candidates:
         return None
 
-    values.sort(
-        key=lambda x: x[0],
-        reverse=True
+    return max(
+        candidates,
+        key=lambda x:
+        candidates.count(x)
     )
 
-    return values[0][1]
-
 
 # ============================================================
-# EXTRAER JUGADOR
+# SUPERVIVENCIA
 # ============================================================
 
-def extract_row(
-    table,
-    row_center
+def extract_survival(
+    texts
 ):
 
-    result = {
-        "player": None,
-        "kills": None,
-        "assists": None,
-        "damage": None,
-        "survival": None,
-        "hp_recovered": None,
-        "rescues": None,
-        "return": None,
-        "score": None,
+    for text in texts:
+
+        text = normalize_number_text(
+            text
+        )
+
+        text = text.replace(
+            ",",
+            "."
+        )
+
+        # 19.3 min
+        matches = re.findall(
+            r"(\d{1,2})[.:](\d{1,2})",
+            text
+        )
+
+        if matches:
+
+            minute, decimal = matches[0]
+
+            try:
+
+                return float(
+                    f"{minute}.{decimal}"
+                )
+
+            except Exception:
+                pass
+
+        # 19.3
+        matches = re.findall(
+            r"\d+\.\d+",
+            text
+        )
+
+        if matches:
+
+            try:
+
+                value = float(
+                    matches[0]
+                )
+
+                if 0 < value <= 60:
+                    return value
+
+            except Exception:
+                pass
+
+    return extract_decimal(
+        texts,
+        60
+    )
+
+
+# ============================================================
+# JUGADOR
+# ============================================================
+
+def extract_player(
+    detections
+):
+
+    candidates = []
+
+    for detection in detections:
+
+        text = clean_player_name(
+            detection["text"]
+        )
+
+        if is_bad_player_text(
+            text
+        ):
+            continue
+
+        candidates.append(
+            detection
+        )
+
+    if not candidates:
+        return None
+
+    # El nombre está en la parte izquierda
+    # de la tabla.
+    candidates.sort(
+        key=lambda d:
+        (
+            -d["score"],
+            d["cx"]
+        )
+    )
+
+    # Preferimos texto corto/medio y con
+    # confianza alta.
+    #
+    # Evitamos textos enormes que normalmente
+    # son frases de interfaz.
+    valid = [
+        d for d in candidates
+        if 3 <= len(d["text"]) <= 30
+    ]
+
+    if not valid:
+        valid = candidates
+
+    best = max(
+        valid,
+        key=lambda d:
+        (
+            d["score"],
+            -abs(
+                d["cx"]
+            )
+        )
+    )
+
+    return clean_player_name(
+        best["text"]
+    )
+
+
+# ============================================================
+# EXTRAER UNA FILA
+# ============================================================
+
+def parse_row(
+    row,
+    boundaries
+):
+
+    cells = {
+        "player": [],
+        "kills": [],
+        "assists": [],
+        "damage": [],
+        "survival": [],
+        "hp_recovered": [],
+        "rescues": [],
+        "return": [],
+        "score": [],
     }
 
-    # --------------------------------------------------------
-    # NOMBRE
-    # --------------------------------------------------------
+    for detection in row:
 
-    result["player"] = read_player(
-        crop_cell(
-            table,
-            row_center,
-            COLUMN_RATIOS["player"]
+        column = detect_column(
+            detection["cx"],
+            boundaries
         )
-    )
 
-    # --------------------------------------------------------
-    # KILLS
-    # --------------------------------------------------------
+        if column is None:
+            continue
 
-    result["kills"] = read_integer(
-        crop_cell(
-            table,
-            row_center,
-            COLUMN_RATIOS["kills"]
-        ),
-        0,
-        50
-    )
-
-    # --------------------------------------------------------
-    # ASSISTS
-    # --------------------------------------------------------
-
-    result["assists"] = read_integer(
-        crop_cell(
-            table,
-            row_center,
-            COLUMN_RATIOS["assists"]
-        ),
-        0,
-        50
-    )
-
-    # --------------------------------------------------------
-    # DAMAGE
-    # --------------------------------------------------------
-
-    result["damage"] = read_integer(
-        crop_cell(
-            table,
-            row_center,
-            COLUMN_RATIOS["damage"]
-        ),
-        0,
-        5000
-    )
-
-    # --------------------------------------------------------
-    # SURVIVAL
-    # --------------------------------------------------------
-
-    result["survival"] = read_survival(
-        crop_cell(
-            table,
-            row_center,
-            COLUMN_RATIOS["survival"]
+        cells[column].append(
+            detection
         )
+
+    player = extract_player(
+        cells["player"]
     )
 
-    # --------------------------------------------------------
-    # HP RECOVERED
-    # --------------------------------------------------------
+    if not player:
+        return None
 
-    result["hp_recovered"] = read_integer(
-        crop_cell(
-            table,
-            row_center,
-            COLUMN_RATIOS["hp_recovered"]
+    result = {
+        "player": player,
+
+        "kills": extract_integer(
+            [
+                d["text"]
+                for d in cells["kills"]
+            ],
+            50
         ),
-        0,
-        5000
-    )
 
-    # --------------------------------------------------------
-    # RESCUES
-    # --------------------------------------------------------
-
-    result["rescues"] = read_integer(
-        crop_cell(
-            table,
-            row_center,
-            COLUMN_RATIOS["rescues"]
+        "assists": extract_integer(
+            [
+                d["text"]
+                for d in cells["assists"]
+            ],
+            50
         ),
-        0,
-        50
-    )
 
-    # --------------------------------------------------------
-    # RETURN
-    # --------------------------------------------------------
-
-    result["return"] = read_integer(
-        crop_cell(
-            table,
-            row_center,
-            COLUMN_RATIOS["return"]
+        "damage": extract_integer(
+            [
+                d["text"]
+                for d in cells["damage"]
+            ],
+            5000
         ),
-        0,
-        50
-    )
 
-    # --------------------------------------------------------
-    # SCORE
-    # --------------------------------------------------------
+        "survival": extract_survival(
+            [
+                d["text"]
+                for d in cells["survival"]
+            ]
+        ),
 
-    result["score"] = read_score(
-        crop_cell(
-            table,
-            row_center,
-            COLUMN_RATIOS["score"]
-        )
-    )
+        "hp_recovered": extract_integer(
+            [
+                d["text"]
+                for d in cells["hp_recovered"]
+            ],
+            5000
+        ),
+
+        "rescues": extract_integer(
+            [
+                d["text"]
+                for d in cells["rescues"]
+            ],
+            50
+        ),
+
+        "return": extract_integer(
+            [
+                d["text"]
+                for d in cells["return"]
+            ],
+            50
+        ),
+
+        "score": extract_decimal(
+            [
+                d["text"]
+                for d in cells["score"]
+            ],
+            150
+        ),
+    }
 
     return result
 
@@ -1166,35 +1131,104 @@ def extract_row(
 MAPS = [
     "Erangel",
     "Miramar",
-    "Rondo",
     "Sanhok",
-    "Livik",
     "Vikendi",
+    "Livik",
     "Karakin",
     "Nusa",
+    "Rondo",
 ]
 
 
 def detect_map(
-    ocr
+    detections,
+    header_y
 ):
 
-    text = " ".join(
-        item["text"]
-        for item in ocr
-    )
+    # Buscar preferentemente en la parte
+    # superior de la captura.
+    for detection in detections:
 
-    text = normalize_text(
-        text
-    )
+        if (
+            header_y is not None
+            and
+            detection["cy"] > header_y
+        ):
+            continue
 
-    for game_map in MAPS:
+        normalized = normalize_text(
+            detection["text"]
+        )
 
-        if normalize_text(
-            game_map
-        ) in text:
+        for game_map in MAPS:
 
-            return game_map
+            if normalize_text(
+                game_map
+            ) in normalized:
+
+                return game_map
+
+    return None
+
+
+# ============================================================
+# PLACEMENT
+# ============================================================
+
+def detect_placement(
+    detections
+):
+
+    best = None
+
+    for detection in detections:
+
+        text = normalize_number_text(
+            detection["text"]
+        )
+
+        match = re.search(
+            r"#?\s*(\d{1,3})",
+            text
+        )
+
+        if not match:
+            continue
+
+        value = int(
+            match.group(1)
+        )
+
+        if not (
+            1 <= value <= 100
+        ):
+            continue
+
+        # El placement suele estar
+        # muy arriba y a la izquierda.
+        if detection["cx"] > 0.35 * 10000:
+            pass
+
+        score = (
+            detection["score"]
+            +
+            (
+                1.0 /
+                max(
+                    detection["cy"],
+                    1
+                )
+            )
+        )
+
+        if best is None:
+            best = (
+                value,
+                score
+            )
+
+    if best:
+        return best[0]
 
     return None
 
@@ -1204,199 +1238,135 @@ def detect_map(
 # ============================================================
 
 def analyze_image(
-    data,
-    match_number
+    data: bytes,
+    match_number: int
 ):
 
-    if not RAPIDOCR_AVAILABLE:
-
-        return {
-            "match": match_number,
-            "error": (
-                "RapidOCR no está instalado. "
-                "Hay que actualizar requirements.txt."
-            ),
-            "players": []
-        }
-
-    array = np.frombuffer(
-        data,
-        np.uint8
+    original = decode_image(
+        data
     )
 
-    image = cv2.imdecode(
-        array,
-        cv2.IMREAD_COLOR
+    original_h, original_w = (
+        original.shape[:2]
     )
 
-    if image is None:
+    image, scale = resize_for_ocr(
+        original
+    )
 
-        raise ValueError(
-            "No se pudo leer la imagen"
-        )
+    image_h, image_w = (
+        image.shape[:2]
+    )
 
-    original_h, original_w = image.shape[:2]
-
-    # --------------------------------------------------------
-    # 1. OCR GLOBAL
-    #
-    # Solamente para localizar el panel/estructura.
-    # --------------------------------------------------------
-
-    global_ocr = run_ocr(
+    detections = run_ocr(
         image
     )
 
-    # --------------------------------------------------------
-    # 2. LOCALIZAR PANEL
-    # --------------------------------------------------------
-
-    panel = detect_result_panel(
-        image
-    )
-
-    if panel is None:
+    if not detections:
 
         return {
             "match": match_number,
-            "error": (
-                "No se pudo localizar "
-                "el panel de resultados."
-            ),
+            "map": None,
+            "placement": None,
             "players": [],
-            "debug": {
-                "image_size": [
-                    original_w,
-                    original_h
-                ],
-                "ocr_words": len(
-                    global_ocr
-                )
-            }
+            "error": "RapidOCR no detectó texto",
         }
 
-    # --------------------------------------------------------
-    # 3. NORMALIZAR
-    # --------------------------------------------------------
-
-    normalized = normalize_panel(
-        image,
-        panel
+    headers = find_header_detections(
+        detections
     )
 
-    if normalized is None:
-
-        return {
-            "match": match_number,
-            "error": (
-                "No se pudo normalizar "
-                "el panel."
-            ),
-            "players": []
-        }
-
-    # --------------------------------------------------------
-    # 4. DETECTAR FILAS
-    # --------------------------------------------------------
-
-    rows = detect_rows(
-        normalized
+    header_y = get_header_y(
+        headers
     )
 
-    if not rows:
+    columns = build_columns(
+        headers,
+        image_w
+    )
 
-        return {
-            "match": match_number,
-            "error": (
-                "No se pudieron detectar "
-                "las filas de jugadores."
-            ),
-            "players": [],
-            "debug": {
-                "panel": panel,
-                "normalized_size": [
-                    NORMALIZED_WIDTH,
-                    NORMALIZED_HEIGHT
-                ]
-            }
-        }
+    boundaries = column_boundaries(
+        columns,
+        image_w
+    )
 
-    # --------------------------------------------------------
-    # 5. EXTRAER JUGADORES
-    # --------------------------------------------------------
+    rows = group_rows(
+        detections,
+        header_y,
+        image_h
+    )
 
     players = []
 
-    for row_index, row_center in enumerate(
-        rows,
-        1
-    ):
+    for row in rows:
 
-        player = extract_row(
-            normalized,
-            row_center
+        player = parse_row(
+            row,
+            boundaries
         )
 
-        player["row"] = row_index
+        if player is None:
+            continue
 
-        # ----------------------------------------------------
-        # IMPORTANTE:
-        #
-        # No descartamos automáticamente una fila solo
-        # porque el nombre falle.
-        #
-        # Esto evita perder jugadores.
-        # ----------------------------------------------------
+        # Evitar duplicados.
+        normalized_name = normalize_text(
+            player["player"]
+        )
 
-        if any(
-            value is not None
-            for key, value in player.items()
-            if key != "row"
-        ):
+        duplicate = False
+
+        for existing in players:
+
+            if normalize_text(
+                existing["player"]
+            ) == normalized_name:
+
+                duplicate = True
+                break
+
+        if not duplicate:
+
+            player["match"] = match_number
 
             players.append(
                 player
             )
 
-    # --------------------------------------------------------
-    # 6. MAPA
-    # --------------------------------------------------------
-
-    map_name = detect_map(
-        global_ocr
-    )
-
-    # --------------------------------------------------------
-    # 7. RESULTADO
-    # --------------------------------------------------------
-
     return {
         "match": match_number,
-        "map": map_name,
-        "placement": None,
+        "map": detect_map(
+            detections,
+            header_y
+        ),
+        "placement": detect_placement(
+            detections
+        ),
         "players": players,
 
+        # Información de diagnóstico.
+        # No afecta a la interfaz actual.
         "debug": {
-            "image_size": [
-                original_w,
-                original_h
-            ],
-            "panel": panel,
-            "normalized_size": [
-                NORMALIZED_WIDTH,
-                NORMALIZED_HEIGHT
-            ],
-            "rows": rows,
-            "ocr_engine": "RapidOCR",
-            "players_detected": len(
-                players
-            )
-        }
+            "image": {
+                "width": original_w,
+                "height": original_h,
+            },
+            "ocr_detections": len(
+                detections
+            ),
+            "header_y": header_y,
+            "headers_found": list(
+                headers.keys()
+            ),
+            "columns": columns,
+            "rows_detected": len(
+                rows
+            ),
+        },
     }
 
 
 # ============================================================
-# HOME
+# WEB
 # ============================================================
 
 @app.get(
@@ -1405,14 +1375,16 @@ def analyze_image(
 )
 def home():
 
-    return open(
+    with open(
         "static/index.html",
         encoding="utf-8"
-    ).read()
+    ) as file:
+
+        return file.read()
 
 
 # ============================================================
-# API ANALYZE
+# ANALIZAR
 # ============================================================
 
 @app.post(
@@ -1424,7 +1396,7 @@ async def analyze(
 
     results = []
 
-    for i, file in enumerate(
+    for index, file in enumerate(
         files,
         1
     ):
@@ -1435,7 +1407,7 @@ async def analyze(
 
             result = analyze_image(
                 data,
-                i
+                index
             )
 
             results.append(
@@ -1446,9 +1418,9 @@ async def analyze(
 
             results.append(
                 {
-                    "match": i,
+                    "match": index,
                     "error": str(error),
-                    "players": []
+                    "players": [],
                 }
             )
 
