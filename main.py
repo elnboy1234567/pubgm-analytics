@@ -207,24 +207,81 @@ def is_bad_player_text(text: str) -> bool:
 
 def run_ocr(image):
     """
-    Ejecuta RapidOCR.
-
-    Se utiliza detección + reconocimiento para obtener:
-        texto
-        confianza
-        coordenadas
+    Ejecuta PaddleOCR y convierte su resultado
+    al formato interno que utiliza el proyecto.
     """
 
-    result = ocr(image)
+    output = []
 
-    # rapidocr_onnxruntime 1.x normalmente devuelve:
-    #
-    # result, elapse_list
-    #
-    # Pero dejamos compatibilidad con otras formas de retorno.
+    try:
+        results = ocr.predict(image)
 
-    if isinstance(result, tuple):
-        result = result[0]
+        for result in results:
+
+            # PaddleOCR 3.x expone los resultados
+            # mediante result.json
+            if hasattr(result, "json"):
+
+                data = result.json
+
+                if callable(data):
+                    data = data()
+
+            elif isinstance(result, dict):
+
+                data = result
+
+            else:
+                continue
+
+            # Algunas versiones envuelven el resultado
+            # dentro de la clave "res".
+            if isinstance(data, dict) and "res" in data:
+                data = data["res"]
+
+            if not isinstance(data, dict):
+                continue
+
+            texts = data.get(
+                "rec_texts",
+                []
+            )
+
+            scores = data.get(
+                "rec_scores",
+                []
+            )
+
+            boxes = data.get(
+                "rec_polys",
+                data.get(
+                    "dt_polys",
+                    []
+                )
+            )
+
+            for box, text, score in zip(
+                boxes,
+                texts,
+                scores
+            ):
+
+                add_detection(
+                    output,
+                    box,
+                    text,
+                    score
+                )
+
+    except Exception as error:
+
+        print(
+            f"PaddleOCR error: {error}"
+        )
+
+        return []
+
+    return output
 
     return parse_ocr_result(result)
 
