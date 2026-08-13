@@ -4,3 +4,5 @@ python-multipart
 opencv-python-headless
 numpy
 rapidocr_onnxruntime
+paddlepaddle==3.2.0
+paddleocr
