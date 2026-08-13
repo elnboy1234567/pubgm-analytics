@@ -14,10 +14,14 @@ from paddleocr import PaddleOCR
 app = FastAPI(title="PUBGM Analytics")
 
 # ============================================================
-# RAPIDOCR
+# PADDLEOCR
 # ============================================================
 
-ocr = RapidOCR()
+ocr = PaddleOCR(
+    use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    use_textline_orientation=False,
+)
 
 
 # ============================================================
